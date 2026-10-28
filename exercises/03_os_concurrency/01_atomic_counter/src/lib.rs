@@ -1,12 +1,4 @@
-//! # Atomic Operations Basics
-//!
-//! In this exercise, you will use atomic types to implement a lock-free thread‑safe counter.
-//!
-//! ## Key Concepts
-//! - `std::sync::atomic::AtomicU64`
-//! - `fetch_add`, `fetch_sub`, `load`, `store` operations
-//! - `compare_exchange` lock‑free primitive
-//! - `Ordering` memory ordering
+/* Atomic counter operations and a retrying compare-and-swap update. */
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,48 +13,59 @@ impl AtomicCounter {
         }
     }
 
-    /// Atomically increments by 1, returns the value **before** increment.
-    ///
-    /// Hint: use `fetch_add` with `Ordering::Relaxed`
     pub fn increment(&self) -> u64 {
-        // TODO
-        todo!()
+        self.value.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Atomically decrements by 1, returns the value **before** decrement.
     pub fn decrement(&self) -> u64 {
-        // TODO
-        todo!()
+        self.value.fetch_sub(1, Ordering::Relaxed)
     }
 
-    /// Gets the current value.
     pub fn get(&self) -> u64 {
-        // TODO
-        todo!()
+        self.value.load(Ordering::Relaxed)
     }
 
-    /// Atomic CAS (Compare-And-Swap) operation.
-    /// If current value equals `expected`, set to `new_val` and return Ok(expected).
-    /// Otherwise return Err(actual current value).
-    ///
-    /// Hint: use `compare_exchange` with success ordering `Ordering::AcqRel` and failure ordering `Ordering::Acquire`
     pub fn compare_and_swap(&self, expected: u64, new_val: u64) -> Result<u64, u64> {
-        // TODO
-        todo!()
+        self.value
+            .compare_exchange(expected, new_val, Ordering::AcqRel, Ordering::Acquire)
     }
 
-    /// Multiply the value atomically using a CAS loop.
-    /// Returns the value **before** multiplication.
-    ///
-    /// Hint: read current value in loop, compute new value, try CAS to update, retry on failure.
     pub fn fetch_multiply(&self, multiplier: u64) -> u64 {
-        // TODO: CAS loop
-        // loop {
-        //     let current = ...
-        //     let new = current * multiplier;
-        //     match self.compare_and_swap(current, new) { ... }
-        // }
-        todo!()
+        let mut current = self.get();
+        loop {
+            match self.compare_and_swap(current, current.wrapping_mul(multiplier)) {
+                Ok(previous) => return previous,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn multiplication_retries_and_wraps_like_atomic_add() {
+        let counter = Arc::new(AtomicCounter::new(1));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..4 {
+                        counter.fetch_multiply(2);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(counter.get(), 1 << 32);
+        let counter = AtomicCounter::new(u64::MAX);
+        assert_eq!(counter.fetch_multiply(2), u64::MAX);
+        assert_eq!(counter.get(), u64::MAX - 1);
     }
 }
 

@@ -1,33 +1,7 @@
-//! # Bump Allocator (no_std)
-//!
-//! Implement the simplest heap memory allocator: a Bump Allocator (bump pointer allocator).
-//!
-//! ## How It Works
-//!
-//! A Bump Allocator maintains a pointer `next` to the "next available address".
-//! On each allocation, it aligns `next` to the requested alignment, then advances by `size` bytes.
-//! It does not support freeing individual objects (`dealloc` is a no-op).
-//!
-//! ```text
-//! heap_start                              heap_end
-//! |----[allocated]----[allocated]----| next |---[free]---|
-//!                                        ^
-//!                                    next allocation starts here
-//! ```
-//!
-//! ## Task
-//!
-//! Implement `BumpAllocator`'s `GlobalAlloc::alloc` method:
-//! 1. Align the current `next` up to `layout.align()`
-//!    Hint: `align_up(addr, align) = (addr + align - 1) & !(align - 1)`
-//! 2. Check if the aligned address plus `layout.size()` exceeds `heap_end`
-//! 3. If it exceeds, return `null_mut()`; otherwise atomically update `next` with `compare_exchange`
-//!
-//! ## Key Concepts
-//!
-//! - `core::alloc::{GlobalAlloc, Layout}`
-//! - Memory alignment calculation
-//! - `AtomicUsize` and `compare_exchange` (CAS loop)
+/*
+ * A no_std bump allocator with checked alignment and atomic reservations.
+ * Individual deallocations do not reclaim storage.
+ */
 
 #![cfg_attr(not(test), no_std)]
 
@@ -56,25 +30,38 @@ impl BumpAllocator {
     }
 
     /// Reset the allocator (free all allocated memory).
+    ///
+    /// Call only after all earlier allocations have stopped being used and
+    /// while no other thread is allocating or resetting this allocator.
     pub fn reset(&self) {
         self.next.store(self.heap_start, Ordering::SeqCst);
     }
 }
 
+// SAFETY: Checked bounds and CAS reserve disjoint regions; the constructor and
+// reset contracts require exclusive backing storage and quiescent resets.
 unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // TODO: Implement bump allocation
-        //
-        // Steps:
-        // 1. Load current next (use Ordering::SeqCst)
-        // 2. Align next up to layout.align()
-        //    Hint: align_up(addr, align) = (addr + align - 1) & !(align - 1)
-        // 3. Compute allocation end = aligned + layout.size()
-        // 4. If end > heap_end, return null_mut()
-        // 5. Atomically update next to end using compare_exchange
-        //    (if CAS fails, another thread raced — retry in a loop)
-        // 6. Return the aligned address as a pointer
-        todo!()
+        let mut next = self.next.load(Ordering::SeqCst);
+        loop {
+            let Some(aligned) = next.checked_add(layout.align() - 1) else {
+                return null_mut();
+            };
+            let aligned = aligned & !(layout.align() - 1);
+            let Some(end) = aligned.checked_add(layout.size()) else {
+                return null_mut();
+            };
+            if aligned < self.heap_start || end > self.heap_end {
+                return null_mut();
+            }
+            match self
+                .next
+                .compare_exchange(next, end, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return aligned as *mut u8,
+                Err(current) => next = current,
+            }
+        }
     }
 
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
@@ -166,5 +153,49 @@ mod tests {
             p1, p2,
             "address after reset should match the first allocation"
         );
+    }
+
+    #[test]
+    fn test_failed_allocation_preserves_remaining_space() {
+        let (alloc, _heap) = make_allocator();
+        // SAFETY: The test keeps the backing heap alive and uses nonzero layouts.
+        unsafe {
+            let first = alloc.alloc(Layout::from_size_align(64, 1).unwrap());
+            assert!(!first.is_null());
+            assert!(alloc
+                .alloc(Layout::from_size_align(HEAP_SIZE, 1).unwrap())
+                .is_null());
+            let rest = alloc.alloc(Layout::from_size_align(HEAP_SIZE - 64, 1).unwrap());
+            assert_eq!(rest, first.add(64));
+        }
+    }
+
+    #[test]
+    fn test_concurrent_allocations_do_not_overlap() {
+        let (alloc, _heap) = make_allocator();
+        let mut addresses = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let allocator = &alloc;
+                handles.push(scope.spawn(move || {
+                    (0..16)
+                        .map(|_| {
+                            // SAFETY: The backing heap outlives all scoped workers.
+                            let ptr =
+                                unsafe { allocator.alloc(Layout::from_size_align(16, 8).unwrap()) };
+                            assert!(!ptr.is_null());
+                            ptr as usize
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        addresses.sort_unstable();
+        assert_eq!(addresses.len(), 128);
+        assert!(addresses.windows(2).all(|pair| pair[0] + 16 <= pair[1]));
     }
 }

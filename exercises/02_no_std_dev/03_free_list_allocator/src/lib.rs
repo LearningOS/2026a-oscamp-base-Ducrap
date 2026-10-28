@@ -1,43 +1,14 @@
-//! # Free-List Allocator
-//!
-//! Building on the bump allocator, implement a Free-List Allocator that supports memory reclamation.
-//!
-//! ## How It Works
-//!
-//! A Free-List Allocator uses a linked list to track all freed memory blocks.
-//! On allocation, it first searches the list for a suitable block (first-fit strategy);
-//! if none is found, it falls back to allocating from the unused region.
-//! On deallocation, the block is inserted at the head of the list.
-//!
-//! ```text
-//! free_list -> [block A: 64B] -> [block B: 128B] -> [block C: 32B] -> null
-//! ```
-//!
-//! Each free block stores a `FreeBlock` struct at its head (containing block size and next pointer).
-//!
-//! ## Task
-//!
-//! Implement `FreeListAllocator`'s `alloc` and `dealloc` methods:
-//!
-//! ### alloc
-//! 1. Traverse the free_list, find the first block with `size >= layout.size()` and proper alignment (first-fit)
-//! 2. If found, remove it from the list and return it
-//! 3. If not found, allocate from the `bump` region (same as bump allocator)
-//!
-//! ### dealloc
-//! 1. Write `FreeBlock` header info at the freed block
-//! 2. Insert it at the head of free_list
-//!
-//! ## Key Concepts
-//!
-//! - Intrusive linked list
-//! - `*mut T` read/write: `ptr.write(val)` / `ptr.read()`
-//! - Memory alignment checks
+/*
+ * A first-fit free-list allocator with atomic bump fallback.
+ * A spin lock protects complete list operations; allocation is not reentrant.
+ */
 
 #![cfg_attr(not(test), no_std)]
 
 use core::alloc::{GlobalAlloc, Layout};
+use core::cell::UnsafeCell;
 use core::ptr::null_mut;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Free block header, stored at the beginning of each free memory block
 struct FreeBlock {
@@ -49,89 +20,111 @@ pub struct FreeListAllocator {
     heap_start: usize,
     heap_end: usize,
     /// Bump pointer: unallocated region starts here
-    bump_next: core::sync::atomic::AtomicUsize,
-    /// Free list head (protected by Mutex in test, UnsafeCell otherwise)
-    #[cfg(test)]
-    free_list: std::sync::Mutex<*mut FreeBlock>,
-    #[cfg(not(test))]
-    free_list: core::cell::UnsafeCell<*mut FreeBlock>,
+    bump_next: AtomicUsize,
+    free_list: UnsafeCell<*mut FreeBlock>,
+    list_locked: AtomicBool,
 }
 
-#[cfg(test)]
+// SAFETY: Heap addresses are owned by the allocator and all list access is locked.
 unsafe impl Send for FreeListAllocator {}
-#[cfg(test)]
+// SAFETY: The spin lock protects free headers; the bump cursor is atomic.
 unsafe impl Sync for FreeListAllocator {}
-#[cfg(not(test))]
-unsafe impl Send for FreeListAllocator {}
-#[cfg(not(test))]
-unsafe impl Sync for FreeListAllocator {}
+
+struct ListGuard<'a>(&'a AtomicBool);
+
+impl Drop for ListGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 impl FreeListAllocator {
     /// # Safety
-    /// `heap_start..heap_end` must be a valid readable and writable memory region.
+    /// `heap_start..heap_end` must remain valid, readable, writable, and exclusive
+    /// to this allocator for as long as the allocator or its allocations are used.
     pub unsafe fn new(heap_start: usize, heap_end: usize) -> Self {
         Self {
             heap_start,
             heap_end,
-            bump_next: core::sync::atomic::AtomicUsize::new(heap_start),
-            #[cfg(test)]
-            free_list: std::sync::Mutex::new(null_mut()),
-            #[cfg(not(test))]
-            free_list: core::cell::UnsafeCell::new(null_mut()),
+            bump_next: AtomicUsize::new(heap_start),
+            free_list: UnsafeCell::new(null_mut()),
+            list_locked: AtomicBool::new(false),
         }
     }
 
-    #[cfg(test)]
-    fn free_list_head(&self) -> *mut FreeBlock {
-        *self.free_list.lock().unwrap()
-    }
-
-    #[cfg(test)]
-    fn set_free_list_head(&self, head: *mut FreeBlock) {
-        *self.free_list.lock().unwrap() = head;
-    }
-
-    #[cfg(not(test))]
-    fn free_list_head(&self) -> *mut FreeBlock {
-        unsafe { *self.free_list.get() }
-    }
-
-    #[cfg(not(test))]
-    fn set_free_list_head(&self, head: *mut FreeBlock) {
-        unsafe { *self.free_list.get() = head }
+    fn with_free_list<T>(&self, operation: impl FnOnce(&mut *mut FreeBlock) -> T) -> T {
+        while self
+            .list_locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        let _guard = ListGuard(&self.list_locked);
+        // SAFETY: Only the thread holding this lock accesses the head or free headers.
+        operation(unsafe { &mut *self.free_list.get() })
     }
 }
 
+// SAFETY: Atomic reservations do not overlap, and free headers are accessed
+// only while the list lock is held and the corresponding block is not in use.
 unsafe impl GlobalAlloc for FreeListAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // Ensure block is at least large enough to hold a FreeBlock header (for future dealloc)
         let size = layout.size().max(core::mem::size_of::<FreeBlock>());
         let align = layout.align().max(core::mem::align_of::<FreeBlock>());
 
-        // TODO: Step 1 — traverse free_list, find a suitable block (first-fit)
-        //
-        // Hints:
-        // - Use prev_ptr and curr to traverse the list
-        // - Check if curr address satisfies align, and (*curr).size >= size
-        // - If found, remove it from the list (update prev's next or the free_list head)
-        // - Return curr as *mut u8
+        let reused = self.with_free_list(|head| {
+            let mut link: *mut *mut FreeBlock = head;
+            // SAFETY: Each link points to the locked head or an initialized free header.
+            unsafe {
+                while !(*link).is_null() {
+                    let block = *link;
+                    if (block as usize) % align == 0 && (*block).size >= size {
+                        *link = (*block).next;
+                        return Some(block.cast::<u8>());
+                    }
+                    link = core::ptr::addr_of_mut!((*block).next);
+                }
+            }
+            None
+        });
+        if let Some(block) = reused {
+            return block;
+        }
 
-        // TODO: Step 2 — no suitable block in free_list, allocate from bump region
-        //
-        // Same logic as 02_bump_allocator's alloc
-        todo!()
+        let mut next = self.bump_next.load(Ordering::SeqCst);
+        loop {
+            let Some(aligned) = next.checked_add(align - 1) else {
+                return null_mut();
+            };
+            let aligned = aligned & !(align - 1);
+            let Some(end) = aligned.checked_add(size) else {
+                return null_mut();
+            };
+            if aligned < self.heap_start || end > self.heap_end {
+                return null_mut();
+            }
+            match self
+                .bump_next
+                .compare_exchange(next, end, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return aligned as *mut u8,
+                Err(current) => next = current,
+            }
+        }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let size = layout.size().max(core::mem::size_of::<FreeBlock>());
 
-        // TODO: Insert the freed block at the head of free_list
-        //
-        // Steps:
-        // 1. Cast ptr to *mut FreeBlock
-        // 2. Write FreeBlock { size, next: current list head }
-        // 3. Update free_list head to ptr
-        todo!()
+        self.with_free_list(|head| {
+            let block = ptr.cast::<FreeBlock>();
+            // SAFETY: alloc reserves header size/alignment, and the caller has
+            // relinquished this live allocation with its original layout.
+            unsafe { block.write(FreeBlock { size, next: *head }) };
+            *head = block;
+        });
     }
 }
 
@@ -209,5 +202,64 @@ mod tests {
         let layout = Layout::from_size_align(HEAP_SIZE + 1, 1).unwrap();
         let ptr = unsafe { alloc.alloc(layout) };
         assert!(ptr.is_null(), "should return null when exceeding heap");
+    }
+
+    #[test]
+    fn test_first_fit_skips_small_head() {
+        let (alloc, _heap) = make_allocator();
+        let small = Layout::from_size_align(32, 8).unwrap();
+        let large = Layout::from_size_align(128, 8).unwrap();
+        // SAFETY: Each live allocation is freed once with its original layout.
+        unsafe {
+            let large_ptr = alloc.alloc(large);
+            let small_ptr = alloc.alloc(small);
+            assert!(!large_ptr.is_null() && !small_ptr.is_null());
+            alloc.dealloc(large_ptr, large);
+            alloc.dealloc(small_ptr, small);
+            assert_eq!(alloc.alloc(large), large_ptr);
+            assert_eq!(alloc.alloc(small), small_ptr);
+        }
+    }
+
+    #[test]
+    fn test_small_allocations_reserve_free_headers() {
+        let (alloc, _heap) = make_allocator();
+        let layout = Layout::from_size_align(1, 1).unwrap();
+        // SAFETY: The allocator must reserve room for a header even for one byte.
+        unsafe {
+            let first = alloc.alloc(layout);
+            let second = alloc.alloc(layout);
+            assert!(!first.is_null() && !second.is_null());
+            second.write(0xAB);
+            alloc.dealloc(first, layout);
+            assert_eq!(second.read(), 0xAB);
+            assert_eq!(alloc.alloc(layout), first);
+        }
+    }
+
+    #[test]
+    fn test_concurrent_reuse_preserves_live_blocks() {
+        let (alloc, _heap) = make_allocator();
+        std::thread::scope(|scope| {
+            for worker in 0usize..8 {
+                let allocator = &alloc;
+                scope.spawn(move || {
+                    let layout =
+                        Layout::from_size_align(32, core::mem::align_of::<usize>()).unwrap();
+                    for _ in 0..100 {
+                        // SAFETY: The scoped heap stays alive. Each worker accesses
+                        // only its own live block and frees it with the same layout.
+                        unsafe {
+                            let ptr = allocator.alloc(layout);
+                            assert!(!ptr.is_null());
+                            ptr.cast::<usize>().write(worker);
+                            std::thread::yield_now();
+                            assert_eq!(ptr.cast::<usize>().read(), worker);
+                            allocator.dealloc(ptr, layout);
+                        }
+                    }
+                });
+            }
+        });
     }
 }

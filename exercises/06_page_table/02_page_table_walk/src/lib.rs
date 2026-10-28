@@ -1,122 +1,89 @@
-//! # Single‑Level Page Table Address Translation
-//!
-//! This exercise simulates a simple single‑level page table to help you understand the process of virtual‑to‑physical address translation.
-//!
-//! ## Concepts
-//! - Virtual address = Virtual Page Number (VPN) + Page Offset (offset)
-//! - Page table: VPN → PPN mapping table
-//! - Address translation: Physical address = PPN × PAGE_SIZE + offset
-//! - Page fault: accessing an unmapped virtual page
-//!
-//! ## Address Format (Simplified Model)
-//! ```text
-//! Virtual address (32‑bit):
-//! 31          12 11          0
-//! ┌──────────────┬────────────┐
-//! │   VPN (20 bits)  │ offset (12 bits) │
-//! └──────────────┴────────────┘
-//!
-//! Page size: 4KB (2^12 = 4096 bytes)
-//! ```
+/* Translate 32-bit addresses with a single-level table and write permissions. */
 
-/// 页大小 4KB
 pub const PAGE_SIZE: usize = 4096;
-/// 页内偏移位数
 pub const PAGE_OFFSET_BITS: u32 = 12;
-
-/// 页表项标志
 pub const PTE_VALID: u8 = 1 << 0;
 pub const PTE_READ: u8 = 1 << 1;
 pub const PTE_WRITE: u8 = 1 << 2;
 
-/// 页表项
 #[derive(Clone, Copy, Debug)]
 pub struct PageTableEntry {
     pub ppn: u32,
     pub flags: u8,
 }
 
-/// 翻译结果
 #[derive(Debug, PartialEq)]
 pub enum TranslateResult {
-    /// 翻译成功，得到物理地址
     Ok(u32),
-    /// 缺页：虚拟页未映射
     PageFault,
-    /// 权限错误：尝试写入只读页
     PermissionDenied,
 }
 
-/// 单级页表，最多支持 `MAX_PAGES` 个虚拟页。
 pub struct SingleLevelPageTable {
     entries: Vec<Option<PageTableEntry>>,
 }
 
 impl SingleLevelPageTable {
-    /// 创建一个空页表，支持 `max_pages` 个虚拟页。
     pub fn new(max_pages: usize) -> Self {
         Self {
             entries: vec![None; max_pages],
         }
     }
 
-    /// 将虚拟页号 `vpn` 映射到物理页号 `ppn`，并设置标志位 `flags`。
-    ///
-    /// 提示：在 `entries[vpn]` 处存放一个 `PageTableEntry`。
     pub fn map(&mut self, vpn: usize, ppn: u32, flags: u8) {
-        // TODO: 在页表中建立 vpn -> ppn 的映射
-        todo!()
+        self.entries[vpn] = Some(PageTableEntry { ppn, flags });
     }
 
-    /// 取消虚拟页号 `vpn` 的映射。
     pub fn unmap(&mut self, vpn: usize) {
-        // TODO: 将 entries[vpn] 设为 None
-        todo!()
+        if let Some(entry) = self.entries.get_mut(vpn) {
+            *entry = None;
+        }
     }
 
-    /// 查询虚拟页号 `vpn` 对应的页表项。
     pub fn lookup(&self, vpn: usize) -> Option<&PageTableEntry> {
-        // TODO: 返回 entries[vpn] 的引用（如果存在）
-        todo!()
+        self.entries.get(vpn)?.as_ref()
     }
 
-    /// 将虚拟地址翻译为物理地址。
-    ///
-    /// 步骤：
-    /// 1. 从虚拟地址中提取 VPN（高 20 位）和 offset（低 12 位）
-    /// 2. 用 VPN 查页表，如果未映射返回 PageFault
-    /// 3. 检查 PTE_VALID 标志，未置位返回 PageFault
-    /// 4. 如果 `is_write` 为 true，检查 PTE_WRITE 标志
-    /// 5. 计算物理地址 = ppn * PAGE_SIZE + offset
     pub fn translate(&self, va: u32, is_write: bool) -> TranslateResult {
-        // TODO: 实现虚拟地址到物理地址的翻译
-        // 提示：
-        //   let vpn = (va >> PAGE_OFFSET_BITS) as usize;
-        //   let offset = va & ((1 << PAGE_OFFSET_BITS) - 1);
-        todo!()
+        let Some(entry) = self.lookup(va_to_vpn(va)) else {
+            return TranslateResult::PageFault;
+        };
+        if entry.flags & PTE_VALID == 0 {
+            return TranslateResult::PageFault;
+        }
+        if is_write && entry.flags & PTE_WRITE == 0 {
+            return TranslateResult::PermissionDenied;
+        }
+        TranslateResult::Ok(make_pa(entry.ppn, va_to_offset(va)))
     }
 }
 
-/// 从虚拟地址中提取虚拟页号。
-///
-/// 提示：右移 PAGE_OFFSET_BITS 位。
 pub fn va_to_vpn(va: u32) -> usize {
-    // TODO
-    todo!()
+    (va >> PAGE_OFFSET_BITS) as usize
 }
 
-/// 从虚拟地址中提取页内偏移。
-///
-/// 提示：用掩码提取低 PAGE_OFFSET_BITS 位。
 pub fn va_to_offset(va: u32) -> u32 {
-    // TODO
-    todo!()
+    va & ((1 << PAGE_OFFSET_BITS) - 1)
 }
 
-/// 由物理页号和偏移量拼出物理地址。
 pub fn make_pa(ppn: u32, offset: u32) -> u32 {
-    // TODO
-    todo!()
+    (ppn << PAGE_OFFSET_BITS) | va_to_offset(offset)
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+
+    #[test]
+    fn out_of_range_and_unmapped_addresses_fault() {
+        let mut pt = SingleLevelPageTable::new(1);
+        assert!(pt.lookup(1).is_none());
+        assert_eq!(pt.translate(u32::MAX, false), TranslateResult::PageFault);
+        pt.map(0, 0xfffff, PTE_VALID | PTE_READ | PTE_WRITE);
+        assert_eq!(pt.translate(0xfff, true), TranslateResult::Ok(u32::MAX));
+        pt.unmap(0);
+        assert_eq!(pt.translate(0, false), TranslateResult::PageFault);
+    }
 }
 
 #[cfg(test)]

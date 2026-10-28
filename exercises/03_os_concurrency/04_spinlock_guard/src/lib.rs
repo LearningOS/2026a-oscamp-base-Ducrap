@@ -1,15 +1,7 @@
-//! # RAII Spin Lock Guard
-//!
-//! In this exercise, you will implement an RAII guard for a spin lock, causing the lock to be automatically released when leaving scope.
-//! This is a classic application of Rust's ownership system in systems programming.
-//!
-//! ## Key Points
-//! - RAII (Resource Acquisition Is Initialization) pattern
-//! - `Deref` / `DerefMut` traits for transparent access
-//! - `Drop` trait for automatic release
-//! - Why manual lock/unlock is unsafe (forgetting unlock, panic without release)
+/* Release a spin lock automatically when its exclusive guard is dropped. */
 
 use std::cell::UnsafeCell;
+use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,10 +13,10 @@ pub struct SpinLock<T> {
 unsafe impl<T: Send> Sync for SpinLock<T> {}
 unsafe impl<T: Send> Send for SpinLock<T> {}
 
-/// Spin lock guard: RAII handle holding the lock.
-/// Automatically releases the lock when SpinGuard is dropped.
 pub struct SpinGuard<'a, T> {
     lock: &'a SpinLock<T>,
+    // Sharing a guard exposes &T, so Sync must additionally require T: Sync.
+    marker: PhantomData<&'a mut T>,
 }
 
 impl<T> SpinLock<T> {
@@ -35,39 +27,56 @@ impl<T> SpinLock<T> {
         }
     }
 
-    /// Acquire lock, returning SpinGuard.
-    ///
-    /// TODO: Spin-wait to acquire lock (compare_exchange), return SpinGuard on success.
     pub fn lock(&self) -> SpinGuard<'_, T> {
-        // TODO: Spin-wait to acquire lock
-        // TODO: Return SpinGuard { lock: self }
-        todo!()
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        SpinGuard {
+            lock: self,
+            marker: PhantomData,
+        }
     }
 }
 
-// TODO: Implement Deref trait for SpinGuard
-// Return &T, obtained via self.lock.data.get()
 impl<T> Deref for SpinGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // The guard owns the lock, and shared borrows cannot overlap mutable ones.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
-// TODO: Implement DerefMut trait for SpinGuard
-// Return &mut T
 impl<T> DerefMut for SpinGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
-// TODO: Implement Drop trait for SpinGuard
-// Set lock.locked to false (Release ordering)
 impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        self.lock.locked.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+
+    #[test]
+    fn unwind_releases_the_guard() {
+        let lock = SpinLock::new(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            *lock.lock() = 41;
+            let _guard = lock.lock();
+            panic!("unwind while holding the lock");
+        }));
+        assert!(result.is_err());
+        assert_eq!(*lock.lock(), 41);
     }
 }
 

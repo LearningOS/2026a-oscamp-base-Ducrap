@@ -1,45 +1,17 @@
-//! # Read-Write Lock (Writer-Priority)
-//!
-//! In this exercise, you will implement a **writer-priority** read-write lock from scratch using atomics.
-//! Multiple readers may hold the lock concurrently; a writer holds it exclusively.
-//!
-//! **Note:** Rust's standard library already provides [`std::sync::RwLock`]. This exercise implements
-//! a minimal version for learning the protocol and policy without using the standard one.
-//!
-//! ## Common policies for read-write locks
-//! Different implementations can give different **priority** when both readers and writers are waiting:
-//!
-//! - **Reader-priority (读者优先)**: New readers are allowed to enter while a writer is waiting, so writers
-//!   may be starved if readers keep arriving.
-//! - **Writer-priority (写者优先)**: Once a writer is waiting, no new readers are admitted until that writer
-//!   has run; this exercise implements this policy.
-//! - **Read-write fair (读写公平)**: Requests are served in a fair order (e.g. FIFO or round-robin), so
-//!   neither readers nor writers are systematically starved.
-//!
-//! ## Key Concepts
-//! - **Readers**: share access; many threads can hold a read lock at once.
-//! - **Writer**: exclusive access; only one writer, and no readers while the writer holds the lock.
-//! - **Writer-priority (this implementation)**: when at least one writer is waiting, new readers block
-//!   until the writer runs.
-//!
-//! ## State (single atomic)
-//! We use one `AtomicU32`: low bits = reader count, two flags = writer holding / writer waiting.
-//! All logic is implemented with compare_exchange and load/store; no use of `std::sync::RwLock`.
+/* A spinning read-write lock that keeps readers behind queued writers. */
 
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Maximum number of concurrent readers (fits in state bits).
 const READER_MASK: u32 = (1 << 30) - 1;
-/// Bit set when a writer holds the lock.
 const WRITER_HOLDING: u32 = 1 << 30;
-/// Bit set when at least one writer is waiting (writer-priority: block new readers).
 const WRITER_WAITING: u32 = 1 << 31;
 
-/// Writer-priority read-write lock. Implemented from scratch; does not use `std::sync::RwLock`.
 pub struct RwLock<T> {
     state: AtomicU32,
+    // A waiting bit alone cannot preserve priority across multiple writers.
+    writers: AtomicU32,
     data: UnsafeCell<T>,
 }
 
@@ -50,86 +22,152 @@ impl<T> RwLock<T> {
     pub const fn new(data: T) -> Self {
         Self {
             state: AtomicU32::new(0),
+            writers: AtomicU32::new(0),
             data: UnsafeCell::new(data),
         }
     }
 
-    /// Acquire a read lock. Blocks (spins) until no writer holds and no writer is waiting (writer-priority).
-    ///
-    /// TODO: Implement read lock acquisition
-    /// 1. In a loop, load state (Acquire).
-    /// 2. If WRITER_HOLDING or WRITER_WAITING is set, spin_loop and continue (writer-priority: no new readers while writer waits).
-    /// 3. If reader count (state & READER_MASK) is already READER_MASK, spin and continue.
-    /// 4. Try compare_exchange(s, s + 1, AcqRel, Acquire); on success return RwLockReadGuard { lock: self }.
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
-        // TODO
-        todo!()
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state & (WRITER_HOLDING | WRITER_WAITING) != 0
+                || state & READER_MASK == READER_MASK
+                || self.writers.load(Ordering::SeqCst) != 0
+            {
+                std::hint::spin_loop();
+                continue;
+            }
+            if self
+                .state
+                .compare_exchange_weak(state, state + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // A writer may register between the first check and this CAS.
+                if self.writers.load(Ordering::SeqCst) == 0 {
+                    return RwLockReadGuard { lock: self };
+                }
+                self.state.fetch_sub(1, Ordering::Release);
+            }
+        }
     }
 
-    /// Acquire the write lock. Blocks until no readers and no other writer.
-    ///
-    /// TODO: Implement write lock acquisition (writer-priority)
-    /// 1. Set WRITER_WAITING first: fetch_or(WRITER_WAITING, Release) so new readers will block.
-    /// 2. In a loop: load state; if any readers (READER_MASK) or WRITER_HOLDING, spin_loop and continue.
-    /// 3. Try compare_exchange(WRITER_WAITING, WRITER_HOLDING, ...) to take the lock; or compare_exchange(0, WRITER_HOLDING, ...) if a writer just released.
-    /// 4. On success return RwLockWriteGuard { lock: self }.
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
-        // TODO
-        todo!()
+        self.writers.fetch_add(1, Ordering::SeqCst);
+        self.state.fetch_or(WRITER_WAITING, Ordering::Release);
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state & (READER_MASK | WRITER_HOLDING) == 0
+                && self
+                    .state
+                    .compare_exchange_weak(
+                        state,
+                        state | WRITER_HOLDING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                return RwLockWriteGuard { lock: self };
+            }
+            std::hint::spin_loop();
+        }
     }
 }
 
-/// Guard for a read lock; releases the read lock on drop.
 pub struct RwLockReadGuard<'a, T> {
     lock: &'a RwLock<T>,
 }
 
-// TODO: Implement Deref for RwLockReadGuard
-// Return shared reference to data: unsafe { &*self.lock.data.get() }
 impl<T> Deref for RwLockReadGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // Readers cannot coexist with a writer.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
-// TODO: Implement Drop for RwLockReadGuard
-// Decrement reader count: self.lock.state.fetch_sub(1, Ordering::Release)
 impl<T> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        self.lock.state.fetch_sub(1, Ordering::Release);
     }
 }
 
-/// Guard for a write lock; releases the write lock on drop.
 pub struct RwLockWriteGuard<'a, T> {
     lock: &'a RwLock<T>,
 }
 
-// TODO: Implement Deref for RwLockWriteGuard
-// Return shared reference: unsafe { &*self.lock.data.get() }
 impl<T> Deref for RwLockWriteGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        unsafe { &*self.lock.data.get() }
     }
 }
 
-// TODO: Implement DerefMut for RwLockWriteGuard
-// Return mutable reference: unsafe { &mut *self.lock.data.get() }
 impl<T> DerefMut for RwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        // WRITER_HOLDING excludes all other data access.
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
-// TODO: Implement Drop for RwLockWriteGuard
-// Clear writer bits so lock is free: self.lock.state.fetch_and(!(WRITER_HOLDING | WRITER_WAITING), Ordering::Release)
 impl<T> Drop for RwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        self.lock
+            .state
+            .fetch_and(!WRITER_HOLDING, Ordering::Release);
+        if self.lock.writers.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.lock
+                .state
+                .fetch_and(!WRITER_WAITING, Ordering::Release);
+        }
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+    use std::sync::{mpsc, Arc};
+
+    #[test]
+    fn queued_writers_run_before_a_late_reader() {
+        let lock = Arc::new(RwLock::new(Vec::new()));
+        let initial_reader = lock.read();
+        let (events_tx, events_rx) = mpsc::channel();
+        let writers: Vec<_> = (0..2)
+            .map(|id| {
+                let lock = lock.clone();
+                let events = events_tx.clone();
+                std::thread::spawn(move || {
+                    let mut guard = lock.write();
+                    guard.push(id);
+                    events.send("writer").unwrap();
+                })
+            })
+            .collect();
+        // Both writers are registered but cannot pass the initial reader.
+        while lock.writers.load(Ordering::SeqCst) != 2 {
+            std::thread::yield_now();
+        }
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let reader_lock = lock.clone();
+        let reader = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let guard = reader_lock.read();
+            assert_eq!(guard.len(), 2);
+            events_tx.send("reader").unwrap();
+        });
+        ready_rx.recv().unwrap();
+        drop(initial_reader);
+        let events: Vec<_> = (0..3).map(|_| events_rx.recv().unwrap()).collect();
+        assert_eq!(events, ["writer", "writer", "reader"]);
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        reader.join().unwrap();
+        assert_eq!(lock.writers.load(Ordering::SeqCst), 0);
+        assert_eq!(lock.state.load(Ordering::Acquire), 0);
     }
 }
 

@@ -1,11 +1,6 @@
-//! # Manual Future Implementation
-//!
-//! In this exercise, you will manually implement the `Future` trait for custom types to understand the core mechanism of asynchronous runtime.
-//!
-//! ## Concepts
-//! - `std::future::Future` trait
-//! - `Poll::Ready` and `Poll::Pending`
-//! - The role of `Waker`: notifying the runtime to poll again
+/*
+Implement small futures that wake their executor before returning Pending.
+*/
 
 use std::future::Future;
 use std::pin::Pin;
@@ -23,17 +18,19 @@ impl CountDown {
     }
 }
 
-// TODO: Implement Future trait for CountDown
-// - Output type is &'static str
-// - Each poll: if count == 0, return Poll::Ready("liftoff!")
-// - Otherwise count -= 1, call cx.waker().wake_by_ref(), return Poll::Pending
-//
-// Hint: Use `self.get_mut()` to get `&mut Self` (since self is Pin<&mut Self>)
 impl Future for CountDown {
     type Output = &'static str;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
+        let this = self.get_mut();
+        if this.count == 0 {
+            Poll::Ready("liftoff!")
+        } else {
+            this.count -= 1;
+            // Pending must arrange another poll; no external event wakes this future.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
     }
 }
 
@@ -49,21 +46,65 @@ impl YieldOnce {
     }
 }
 
-// TODO: Implement Future trait for YieldOnce
-// - Output type is ()
-// - First poll: set yielded = true, wake waker, return Pending
-// - Second poll: return Ready(())
 impl Future for YieldOnce {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
+        let this = self.get_mut();
+        if this.yielded {
+            Poll::Ready(())
+        } else {
+            this.yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Wake, Waker};
+
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn test_countdown_poll_and_wake_contract() {
+        let wake_count = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wake_count));
+        let mut context = Context::from_waker(&waker);
+        let mut countdown = CountDown::new(2);
+
+        assert_eq!(Pin::new(&mut countdown).poll(&mut context), Poll::Pending);
+        assert_eq!(countdown.count, 1);
+        assert_eq!(Pin::new(&mut countdown).poll(&mut context), Poll::Pending);
+        assert_eq!(countdown.count, 0);
+        assert_eq!(
+            Pin::new(&mut countdown).poll(&mut context),
+            Poll::Ready("liftoff!")
+        );
+        assert_eq!(wake_count.0.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_yield_once_poll_and_wake_contract() {
+        let wake_count = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wake_count));
+        let mut context = Context::from_waker(&waker);
+        let mut future = YieldOnce::new();
+
+        assert_eq!(Pin::new(&mut future).poll(&mut context), Poll::Pending);
+        assert_eq!(Pin::new(&mut future).poll(&mut context), Poll::Ready(()));
+        assert_eq!(wake_count.0.load(Ordering::Relaxed), 1);
+    }
 
     #[tokio::test]
     async fn test_countdown_zero() {

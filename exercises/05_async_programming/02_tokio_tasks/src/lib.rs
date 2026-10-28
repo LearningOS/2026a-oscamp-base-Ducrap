@@ -1,11 +1,6 @@
-//! # Tokio Async Tasks
-//!
-//! In this exercise, you will use `tokio::spawn` to create concurrent asynchronous tasks.
-//!
-//! ## Concepts
-//! - `tokio::spawn` creates asynchronous tasks
-//! - `JoinHandle` waits for task completion
-//! - Concurrent execution between asynchronous tasks
+/*
+Spawn Tokio tasks before awaiting their results to preserve concurrency.
+*/
 
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
@@ -14,10 +9,14 @@ use tokio::time::{sleep, Duration};
 ///
 /// Hint: Create `tokio::spawn` task for each i, collect JoinHandle, await them sequentially.
 pub async fn concurrent_squares(n: usize) -> Vec<usize> {
-    // TODO: Create n asynchronous tasks, each computing i * i
-    // TODO: Collect all JoinHandle
-    // TODO: Await each one to get result
-    todo!()
+    let handles: Vec<JoinHandle<usize>> = (0..n)
+        .map(|number| tokio::spawn(async move { number * number }))
+        .collect();
+    let mut squares = Vec::with_capacity(n);
+    for handle in handles {
+        squares.push(handle.await.expect("square task panicked"));
+    }
+    squares
 }
 
 /// Concurrently execute multiple "time-consuming" tasks (simulated with sleep), return all results.
@@ -25,10 +24,21 @@ pub async fn concurrent_squares(n: usize) -> Vec<usize> {
 ///
 /// Key: All tasks should execute concurrently, total duration should be close to single task duration, not sum of all tasks.
 pub async fn parallel_sleep_tasks(n: usize, duration_ms: u64) -> Vec<usize> {
-    // TODO: Create asynchronous task for each id in 0..n
-    // TODO: Each task sleeps specified duration and returns its own id
-    // TODO: Collect all results and sort
-    todo!()
+    // Spawn every task before awaiting so their sleeps can overlap.
+    let handles: Vec<JoinHandle<usize>> = (0..n)
+        .map(|id| {
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(duration_ms)).await;
+                id
+            })
+        })
+        .collect();
+    let mut results = Vec::with_capacity(n);
+    for handle in handles {
+        results.push(handle.await.expect("sleep task panicked"));
+    }
+    results.sort_unstable();
+    results
 }
 
 #[cfg(test)]

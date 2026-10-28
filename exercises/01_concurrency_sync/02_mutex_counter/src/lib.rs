@@ -1,11 +1,6 @@
-//! # Mutex Shared State
-//!
-//! In this exercise, you will use `Arc<Mutex<T>>` to safely share and modify data between multiple threads.
-//!
-//! ## Concepts
-//! - `Mutex<T>` mutex protects shared data
-//! - `Arc<T>` atomic reference counting enables cross-thread sharing
-//! - `lock()` acquires the lock and accesses data
+/*
+Share counters and collections between threads using Arc and Mutex.
+*/
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -16,11 +11,21 @@ use std::thread;
 ///
 /// Hint: Use `Arc<Mutex<usize>>` as the shared counter.
 pub fn concurrent_counter(n_threads: usize, count_per_thread: usize) -> usize {
-    // TODO: Create Arc<Mutex<usize>> with initial value 0
-    // TODO: Spawn n_threads threads
-    // TODO: In each thread, lock() and increment count_per_thread times
-    // TODO: Join all threads, return final value
-    todo!()
+    let counter = Arc::new(Mutex::new(0));
+    let mut handles = Vec::with_capacity(n_threads);
+    for _ in 0..n_threads {
+        let counter = Arc::clone(&counter);
+        handles.push(thread::spawn(move || {
+            for _ in 0..count_per_thread {
+                *counter.lock().expect("counter mutex poisoned") += 1;
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("counter thread panicked");
+    }
+    let total = *counter.lock().expect("counter mutex poisoned");
+    total
 }
 
 /// Add elements to a shared vector concurrently using multiple threads.
@@ -29,10 +34,20 @@ pub fn concurrent_counter(n_threads: usize, count_per_thread: usize) -> usize {
 ///
 /// Hint: Use `Arc<Mutex<Vec<usize>>>`.
 pub fn concurrent_collect(n_threads: usize) -> Vec<usize> {
-    // TODO: Create Arc<Mutex<Vec<usize>>>
-    // TODO: Each thread pushes its own id
-    // TODO: After joining all threads, sort the result and return
-    todo!()
+    let values = Arc::new(Mutex::new(Vec::with_capacity(n_threads)));
+    let mut handles = Vec::with_capacity(n_threads);
+    for id in 0..n_threads {
+        let values = Arc::clone(&values);
+        handles.push(thread::spawn(move || {
+            values.lock().expect("collection mutex poisoned").push(id);
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("collection thread panicked");
+    }
+    let mut values = values.lock().expect("collection mutex poisoned");
+    values.sort_unstable();
+    std::mem::take(&mut *values)
 }
 
 #[cfg(test)]

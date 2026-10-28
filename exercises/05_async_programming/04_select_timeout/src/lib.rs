@@ -1,14 +1,9 @@
-//! # Select and Timeout
-//!
-//! In this exercise, you will use `tokio::select!` macro to implement race selection and timeout control.
-//!
-//! ## Concepts
-//! - `tokio::select!` waits for multiple async operations simultaneously
-//! - `tokio::time::timeout` timeout control
-//! - The first completed branch is executed, others are cancelled
+/*
+Apply deadlines and race futures, dropping unfinished operations.
+*/
 
 use std::future::Future;
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 
 /// Async operation with timeout.
 /// If `future` completes within `timeout_ms` milliseconds, returns Some(result).
@@ -19,9 +14,9 @@ pub async fn with_timeout<F, T>(future: F, timeout_ms: u64) -> Option<T>
 where
     F: Future<Output = T>,
 {
-    // TODO: Use tokio::select! to race between future and sleep
-    // Or use tokio::time::timeout
-    todo!()
+    tokio::time::timeout(Duration::from_millis(timeout_ms), future)
+        .await
+        .ok()
 }
 
 /// Race two async tasks, return the result of whichever finishes first.
@@ -32,14 +27,52 @@ where
     F1: Future<Output = T>,
     F2: Future<Output = T>,
 {
-    // TODO: Use tokio::select! to wait for f1 and f2
-    // Return the result of whichever completes first
-    todo!()
+    tokio::select! {
+        result = f1 => result,
+        result = f2 => result,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use tokio::time::sleep;
+
+    struct PendingUntilDropped(Arc<AtomicBool>);
+
+    impl Future for PendingUntilDropped {
+        type Output = i32;
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<i32> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingUntilDropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timeout_drops_unfinished_future() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let result = with_timeout(PendingUntilDropped(Arc::clone(&dropped)), 1).await;
+        assert_eq!(result, None);
+        assert!(dropped.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_race_drops_losing_future() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let result = race(async { 7 }, PendingUntilDropped(Arc::clone(&dropped))).await;
+        assert_eq!(result, 7);
+        assert!(dropped.load(Ordering::Relaxed));
+    }
 
     #[tokio::test]
     async fn test_timeout_success() {

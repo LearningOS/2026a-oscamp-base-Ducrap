@@ -1,18 +1,7 @@
-//! # Green Thread Scheduler (riscv64)
-//!
-//! In this exercise, you build a simple cooperative (green) thread scheduler on top of context switching.
-//! This crate is **riscv64 only**; run with the repo's normal flow (`./check.sh` / `oscamp`) or natively on riscv64.
-//!
-//! ## Key Concepts
-//! - Cooperative vs preemptive scheduling
-//! - Thread state: `Ready`, `Running`, `Finished`
-//! - `yield_now()`: current thread voluntarily gives up the CPU
-//! - Scheduler loop: pick next ready thread and switch to it
-//!
-//! ## Design
-//! Each green thread has its own stack and `TaskContext`. Threads call `yield_now()` to yield.
-//! The scheduler round-robins among ready threads. User entry is wrapped by `thread_wrapper`, which
-//! calls the entry then marks the thread `Finished` and switches back.
+/*
+Cooperative RISC-V green threads. Each thread owns a stack and yields to a
+round-robin scheduler; the entry wrapper handles normal thread completion.
+*/
 
 #![cfg(target_arch = "riscv64")]
 
@@ -74,7 +63,7 @@ extern "C" fn thread_wrapper() {
 ///
 /// Must be `#[unsafe(naked)]` to prevent the compiler from generating a prologue/epilogue.
 #[unsafe(naked)]
-unsafe extern "C" fn switch_context(_old: &mut TaskContext, _new: &TaskContext) {
+unsafe extern "C" fn switch_context(_old: *mut TaskContext, _new: *const TaskContext) {
     naked_asm!(
         "sd sp, 0(a0)",
         "sd ra, 8(a0)",
@@ -137,7 +126,19 @@ impl Scheduler {
     ///    `sp` must be 16-byte aligned (e.g. `(stack_top - 16) & !15` to leave headroom).
     /// 3. Push a `GreenThread` with this context, state `Ready`, and `entry` stored for the wrapper to call.
     pub fn spawn(&mut self, entry: extern "C" fn()) {
-        todo!("alloc stack, init ctx with ra=thread_wrapper and aligned sp, push GreenThread(Ready, entry)")
+        let stack = vec![0; STACK_SIZE];
+        let stack_top = stack.as_ptr() as usize + stack.len();
+        let ctx = TaskContext {
+            sp: ((stack_top - 16) & !15) as u64,
+            ra: thread_wrapper as *const () as u64,
+            ..TaskContext::default()
+        };
+        self.threads.push(GreenThread {
+            ctx,
+            state: ThreadState::Ready,
+            _stack: Some(stack),
+            entry: Some(entry),
+        });
     }
 
     /// Run the scheduler until all threads (except the main one) are `Finished`.
@@ -146,21 +147,56 @@ impl Scheduler {
     /// 2. Loop: if all threads in `threads[1..]` are `Finished`, break; otherwise call `schedule_next()` (which may switch away and later return).
     /// 3. Clear `SCHEDULER` when done.
     pub fn run(&mut self) {
-        todo!("set SCHEDULER to self, loop until threads[1..] all Finished, call schedule_next, then clear SCHEDULER")
+        // Only one scheduler may own the module's callback pointer at a time.
+        let scheduler = self as *mut Self;
+        unsafe { SCHEDULER = scheduler };
+        while self
+            .threads
+            .iter()
+            .skip(1)
+            .any(|t| t.state != ThreadState::Finished)
+        {
+            // All short-lived scheduler borrows end before switching stacks.
+            unsafe { Self::switch_next(scheduler) };
+        }
+        unsafe {
+            SCHEDULER = std::ptr::null_mut();
+            CURRENT_THREAD_ENTRY = None;
+        }
     }
 
-    /// Find the next ready thread (starting from `current + 1` round-robin), mark current as `Ready` (if not `Finished`), mark next as `Running`, set `CURRENT_THREAD_ENTRY` if the next thread has an entry, then switch to it.
-    fn schedule_next(&mut self) {
-        todo!("round-robin find next Ready, set current Ready (if not Finished), next Running, CURRENT_THREAD_ENTRY, then switch_context")
-    }
-}
+    /// Prepare the next runnable context without holding this borrow across a switch.
+    fn schedule_next(&mut self) -> Option<(*mut TaskContext, *const TaskContext)> {
+        let previous = self.current;
+        let count = self.threads.len();
+        let next = (1..count)
+            .map(|offset| (previous + offset) % count)
+            .find(|&index| self.threads[index].state == ThreadState::Ready);
+        let next = next?;
 
-impl TaskContext {
-    fn as_mut_ptr(&mut self) -> *mut TaskContext {
-        self as *mut TaskContext
+        if self.threads[previous].state != ThreadState::Finished {
+            self.threads[previous].state = ThreadState::Ready;
+        }
+        self.threads[next].state = ThreadState::Running;
+        self.current = next;
+        if let Some(entry) = self.threads[next].entry.take() {
+            unsafe { CURRENT_THREAD_ENTRY = Some(entry) };
+        }
+
+        // Derive both field pointers without borrowing the vector's whole slice.
+        let threads = self.threads.as_mut_ptr();
+        let old = unsafe { core::ptr::addr_of_mut!((*threads.add(previous)).ctx) };
+        let new = unsafe { core::ptr::addr_of!((*threads.add(next)).ctx) };
+        Some((old, new))
     }
-    fn as_ptr(&self) -> *const TaskContext {
-        self as *const TaskContext
+
+    unsafe fn switch_next(scheduler: *mut Self) {
+        // Release the mutable scheduler borrow before another thread can reenter it.
+        let contexts = unsafe { (&mut *scheduler).schedule_next() };
+        let Some((old, new)) = contexts else { return };
+        // SAFETY: The contexts are distinct and their owned stacks stay live.
+        // The current thread resumes here only when another switch selects it.
+        unsafe { switch_context(old, new) };
     }
 }
 
@@ -170,7 +206,7 @@ static mut SCHEDULER: *mut Scheduler = std::ptr::null_mut();
 pub fn yield_now() {
     unsafe {
         if !SCHEDULER.is_null() {
-            (*SCHEDULER).schedule_next();
+            Scheduler::switch_next(SCHEDULER);
         }
     }
 }
@@ -179,9 +215,12 @@ pub fn yield_now() {
 fn thread_finished() {
     unsafe {
         if !SCHEDULER.is_null() {
-            let sched = &mut *SCHEDULER;
-            sched.threads[sched.current].state = ThreadState::Finished;
-            sched.schedule_next();
+            let scheduler = SCHEDULER;
+            {
+                let sched = &mut *scheduler;
+                sched.threads[sched.current].state = ThreadState::Finished;
+            }
+            Scheduler::switch_next(scheduler);
         }
     }
 }
@@ -246,5 +285,27 @@ mod tests {
         sched.run();
 
         assert_eq!(SIMPLE_FLAG.load(Ordering::SeqCst), 42);
+    }
+
+    #[test]
+    fn test_empty_scheduler_and_reuse() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let mut sched = Scheduler::new();
+        sched.run();
+        assert_eq!(sched.current, 0);
+
+        for _ in 0..2 {
+            SIMPLE_FLAG.store(0, Ordering::SeqCst);
+            sched.spawn(simple_task);
+            sched.run();
+            assert_eq!(SIMPLE_FLAG.load(Ordering::SeqCst), 42);
+            assert_eq!(sched.current, 0);
+            assert!(sched
+                .threads
+                .iter()
+                .skip(1)
+                .all(|t| t.state == ThreadState::Finished));
+        }
+        assert!(unsafe { SCHEDULER.is_null() });
     }
 }

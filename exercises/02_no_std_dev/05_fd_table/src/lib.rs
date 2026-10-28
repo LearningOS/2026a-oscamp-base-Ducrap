@@ -1,42 +1,7 @@
-//! # File Descriptor Table
-//!
-//! Implement a simple file descriptor (fd) table — the core data structure
-//! for managing open files in an OS kernel.
-//!
-//! ## Background
-//!
-//! In the Linux kernel, each process has an fd table that maps integer fds to kernel file objects.
-//! User programs perform read/write/close via fds, and the kernel looks up the corresponding
-//! file object through the fd table.
-//!
-//! ```text
-//! fd table:
-//!   0 -> Stdin
-//!   1 -> Stdout
-//!   2 -> Stderr
-//!   3 -> File("/etc/passwd")
-//!   4 -> (empty)
-//!   5 -> Socket(...)
-//! ```
-//!
-//! ## Task
-//!
-//! Implement the following methods on `FdTable`:
-//!
-//! - `new()` — create an empty fd table
-//! - `alloc(file)` -> `usize` — allocate a new fd, return the fd number
-//!   - Prefer reusing the smallest closed fd number
-//!   - If no free slot, extend the table
-//! - `get(fd)` -> `Option<Arc<dyn File>>` — get the file object for an fd
-//! - `close(fd)` -> `bool` — close an fd, return whether it succeeded (false if fd doesn't exist)
-//! - `count()` -> `usize` — return the number of currently allocated fds (excluding closed ones)
-//!
-//! ## Key Concepts
-//!
-//! - Trait objects: `Arc<dyn File>`
-//! - `Vec<Option<T>>` as a sparse table
-//! - fd number reuse strategy (find smallest free slot)
-//! - `Arc` reference counting and resource release
+/*
+ * A sparse file descriptor table with shared file ownership.
+ * New descriptors reuse the smallest vacant slot.
+ */
 
 use std::sync::Arc;
 
@@ -48,42 +13,45 @@ pub trait File: Send + Sync {
 
 /// File descriptor table
 pub struct FdTable {
-    // TODO: Design the internal structure
-    // Hint: use Vec<Option<Arc<dyn File>>>
-    //       the index is the fd number, None means the fd is closed or unallocated
+    entries: Vec<Option<Arc<dyn File>>>,
 }
 
 impl FdTable {
     /// Create an empty fd table
     pub fn new() -> Self {
-        // TODO
-        todo!()
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Allocate a new fd, return the fd number.
     ///
     /// Prefers reusing the smallest closed fd number; if no free slot, appends to the end.
     pub fn alloc(&mut self, file: Arc<dyn File>) -> usize {
-        // TODO
-        todo!()
+        for (fd, entry) in self.entries.iter_mut().enumerate() {
+            if entry.is_none() {
+                *entry = Some(file);
+                return fd;
+            }
+        }
+        let fd = self.entries.len();
+        self.entries.push(Some(file));
+        fd
     }
 
     /// Get the file object for an fd. Returns None if the fd doesn't exist or is closed.
     pub fn get(&self, fd: usize) -> Option<Arc<dyn File>> {
-        // TODO
-        todo!()
+        self.entries.get(fd).cloned().flatten()
     }
 
     /// Close an fd. Returns true on success, false if the fd doesn't exist or is already closed.
     pub fn close(&mut self, fd: usize) -> bool {
-        // TODO
-        todo!()
+        self.entries.get_mut(fd).and_then(Option::take).is_some()
     }
 
     /// Return the number of currently allocated fds (excluding closed ones)
     pub fn count(&self) -> usize {
-        // TODO
-        todo!()
+        self.entries.iter().filter(|entry| entry.is_some()).count()
     }
 }
 
@@ -204,5 +172,35 @@ mod tests {
         let f = table.get(fd).unwrap();
         let n = f.write(b"hello");
         assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn test_reuses_smallest_of_multiple_holes() {
+        let mut table = FdTable::new();
+        let fds: Vec<_> = (0..4).map(|id| table.alloc(MockFile::new(id))).collect();
+        assert!(table.close(fds[3]));
+        assert!(table.close(fds[1]));
+        assert_eq!(table.alloc(MockFile::new(10)), 1);
+        assert_eq!(table.alloc(MockFile::new(11)), 3);
+        assert_eq!(table.count(), 4);
+    }
+
+    #[test]
+    fn test_close_releases_only_table_reference() {
+        let mut table = FdTable::new();
+        let file = MockFile::new(42);
+        let fd = table.alloc(file.clone());
+        let retained = table.get(fd).unwrap();
+        assert_eq!(Arc::strong_count(&file), 3);
+        assert!(table.close(fd));
+        assert_eq!(Arc::strong_count(&file), 2);
+        assert!(!table.close(fd));
+        let mut buf = [0];
+        assert_eq!(retained.read(&mut buf), 1);
+        assert_eq!(buf, [42]);
+        drop(retained);
+        assert_eq!(Arc::strong_count(&file), 1);
+        assert!(table.get(usize::MAX).is_none());
+        assert!(!table.close(usize::MAX));
     }
 }
